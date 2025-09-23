@@ -1,0 +1,2 @@
+Hello, this is a new file created by Nano.
+This is my first Git practice.
