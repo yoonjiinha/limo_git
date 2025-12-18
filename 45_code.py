@@ -19,7 +19,7 @@ class LimoCompetitionMaster:
         self.bridge = CvBridge()
 
         # === 주행 파라미터 (미션 #1, #2 대응) ===
-        self.base_speed = 0.17       # 기본 직선 속도
+        self.base_speed = 0.3       # 기본 직선 속도
         self.k_angle = 0.010         # 라인트레이싱 조향 게인
         
         # === 상태 및 센서 변수 ===
