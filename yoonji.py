@@ -49,7 +49,7 @@ class LineTracerWithObstacleAvoidance:
         self.scan_ranges = raw
 
         # 전방 20도 범위의 장애물 감지
-        front_zone = np.concatenate([raw[:10], raw[-10:]])
+        front_zone = np.concatenate([raw[:15], raw[-15:]])
         # 20cm 이상의 유효한 데이터만 필터링
         cleaned = [d for d in front_zone if d > 0.10 and not np.isnan(d) and not np.isinf(d)]
         
@@ -127,7 +127,7 @@ class LineTracerWithObstacleAvoidance:
                         # 두 라바콘 사이의 중앙으로 조향
                         target_x = (valid_cones[0][0] + valid_cones[-1][0]) // 2
                         error = (w // 2) - target_x
-                        steer = error * 0.006 # 게인값 미세 조정
+                        steer = error * 0.007 # 게인값 미세 조정
                     else:
                         # 라바콘이 하나만 보일 때: 급회전 대신 '회피 여유' 확보
                         cone_x = valid_cones[0][0]
