@@ -20,7 +20,7 @@ class LineTracerWithObstacleAvoidance:
         self.bridge = CvBridge()
 
         # === 주행 파라미터 ===
-        self.speed = 0.17        # 기본 주행 속도
+        self.speed = 0.30        # 기본 주행 속도
         self.search_speed = 0.25 # 라인 놓쳤을 때 회전 속도
         
         # === 검은선 트레이싱 튜닝 파라미터 ===
