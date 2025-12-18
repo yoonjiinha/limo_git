@@ -20,11 +20,11 @@ class LineTracerWithObstacleAvoidance:
         self.bridge = CvBridge()
 
         # === 주행 파라미터 ===
-        self.speed = 0.2        # 기본 주행 속도
+        self.speed = 0.17        # 기본 주행 속도
         self.search_speed = 0.25 # 라인 놓쳤을 때 회전 속도
         
         # === 검은선 트레이싱 튜닝 파라미터 ===
-        self.k_angle = 0.010     # 조향 게인 (반응 민감도)
+        self.k_angle = 0.008     # 조향 게인 (반응 민감도)
         self.dark_min_pixels = 5 # 이 값보다 픽셀이 적으면 라인 없음으로 간주
 
         # === 상태 변수 ===
@@ -98,40 +98,51 @@ class LineTracerWithObstacleAvoidance:
                 # ------------------------------------------------
                 # 🔴 [기존 유지] 라바콘(빨간색) 우선 검출 로직
                 # ------------------------------------------------
-                lower_r1 = np.array([0, 100, 80])
-                upper_r1 = np.array([10, 255, 255])
-                lower_r2 = np.array([170, 100, 80])
-                upper_r2 = np.array([180, 255, 255])
+                # 1. 색상 검출 (기존 유지하되 노이즈 제거 강화)
+                lower_r1, upper_r1 = np.array([0, 120, 70]), np.array([10, 255, 255])
+                lower_r2, upper_r2 = np.array([170, 120, 70]), np.array([180, 255, 255])
 
-                mask_r1 = cv2.inRange(hsv, lower_r1, upper_r1)
-                mask_r2 = cv2.inRange(hsv, lower_r2, upper_r2)
-                red_mask = cv2.bitwise_or(mask_r1, mask_r2)
-                red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_OPEN, np.ones((3,3), np.uint8))
-                red_contours, _ = cv2.findContours(red_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                mask_r = cv2.bitwise_or(cv2.inRange(hsv, lower_r1, upper_r1), 
+                                        cv2.inRange(hsv, lower_r2, upper_r2))
+                mask_r = cv2.morphologyEx(mask_r, cv2.MORPH_CLOSE, np.ones((5,5), np.uint8))
+                red_contours, _ = cv2.findContours(mask_r, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
                 valid_cones = []
                 for cnt in red_contours:
-                    if cv2.contourArea(cnt) > 200:
+                    area = cv2.contourArea(cnt)
+                    if 150 < area < 10000: # 너무 작거나 큰 노이즈 제거
                         M = cv2.moments(cnt)
                         if M["m00"] != 0:
                             cx = int(M["m10"] / M["m00"])
-                            valid_cones.append(cx)
+                            valid_cones.append((cx, area))
 
-                # 라바콘이 발견되면 -> 라인트레이싱 무시하고 라바콘 추적
                 if len(valid_cones) > 0:
-                    valid_cones.sort()
-                    if len(valid_cones) >= 2:
-                        target_x = (valid_cones[0] + valid_cones[-1]) // 2
-                    else:
-                        cone_x = valid_cones[0]
-                        if cone_x < w // 2:
-                            target_x = w - 100 
-                        else:
-                            target_x = 100
+                    valid_cones.sort(key=lambda x: x[0]) # X좌표 기준 정렬
                     
-                    error = (w // 2) - target_x
-                    twist.linear.x = 0.15
-                    twist.angular.z = error * 0.005 
+                    # LiDAR 연동: 라바콘 구역에서는 감속 (미션 실패 방지)
+                    cone_speed = 0.12 
+                    if self.front < 0.5: cone_speed = 0.08 # 가까우면 더 감속 [cite: 29]
+
+                    if len(valid_cones) >= 2:
+                        # 두 라바콘 사이의 중앙으로 조향
+                        target_x = (valid_cones[0][0] + valid_cones[-1][0]) // 2
+                        error = (w // 2) - target_x
+                        steer = error * 0.006 # 게인값 미세 조정
+                    else:
+                        # 라바콘이 하나만 보일 때: 급회전 대신 '회피 여유' 확보
+                        cone_x = valid_cones[0][0]
+                        safe_margin = 150 # 라바콘으로부터 떨어질 거리 (픽셀)
+                        
+                        if cone_x < w // 2: # 왼쪽 라바콘 발견 -> 약간 오른쪽으로
+                            target_x = cone_x + safe_margin
+                        else: # 오른쪽 라바콘 발견 -> 약간 왼쪽으로
+                            target_x = cone_x - safe_margin
+                        
+                        error = (w // 2) - target_x
+                        steer = error * 0.005
+
+                    twist.linear.x = cone_speed
+                    twist.angular.z = max(min(steer, 0.8), -0.8)
                     self.pub.publish(twist)
                     return
 
