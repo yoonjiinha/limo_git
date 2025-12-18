@@ -49,7 +49,7 @@ class LineTracerWithObstacleAvoidance:
         self.scan_ranges = raw
 
         # 전방 20도 범위의 장애물 감지
-        front_zone = np.concatenate([raw[:15], raw[-15:]])
+        front_zone = np.concatenate([raw[:20], raw[-20:]])
         # 20cm 이상의 유효한 데이터만 필터링
         cleaned = [d for d in front_zone if d > 0.10 and not np.isnan(d) and not np.isinf(d)]
         
