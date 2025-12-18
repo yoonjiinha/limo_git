@@ -1,0 +1,288 @@
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import rospy
+import cv2
+import numpy as np
+from sensor_msgs.msg import CompressedImage, LaserScan
+from geometry_msgs.msg import Twist
+from cv_bridge import CvBridge
+
+class LineTracerWithObstacleAvoidance:
+    def __init__(self):
+        rospy.init_node("line_tracer_with_obstacle_avoidance")
+        
+        # === ROS 통신 ===
+        self.pub = rospy.Publisher("/cmd_vel", Twist, queue_size=1)
+        rospy.Subscriber("/usb_cam/image_raw/compressed", CompressedImage, self.camera_cb)
+        
+        # 
+        #rospy.Subscriber("/camera/rgb/image_raw/compressed", CompressedImage, self.camera_cb)
+
+        rospy.Subscriber("/scan", LaserScan, self.lidar_cb)
+
+        self.bridge = CvBridge()
+
+        # === 주행 파라미터 ===
+        self.speed = 0.3  #0.2 -> 0.3      # 기본 주행 속도
+        self.search_speed = 0.15 # 라인 놓쳤을 때 회전 속도
+        
+        # === 검은선 트레이싱 튜닝 파라미터 (EdgeLaneNoBridge 값 적용) ===
+        self.k_angle = 0.010     # 조향 게인
+        self.dark_min_pixels = 5 # 최소 픽셀 수
+
+        # === 상태 변수 ===
+        self.scan_ranges = []
+        self.front = 999.0
+        
+        self.state = "LANE"
+        self.state_start = rospy.Time.now().to_sec()
+        self.escape_angle = 0.0
+
+        # 회피 로직 변수
+        self.left_escape_count = 0
+        self.force_right_escape = 0
+
+        rospy.loginfo("=== (최종) 라바콘 우선 + 장애물 회피 + 검은선 트레이싱 시작 ===")
+
+    # ============================================================
+    # LIDAR 콜백 (장애물 감지 - 그대로 유지)
+    # ============================================================
+    def lidar_cb(self, scan):
+        raw = np.array(scan.ranges)
+        self.scan_ranges = raw
+
+        # 전방 20도 범위의 장애물 감지
+        front_zone = np.concatenate([raw[:10], raw[-10:]])
+        # 20cm 이상의 유효한 데이터만 필터링
+        cleaned = [d for d in front_zone if d > 0.10 and not np.isnan(d) and not np.isinf(d)]
+        
+        if cleaned:
+            self.front = np.median(cleaned)
+        else:
+            self.front = 999.0
+
+    # ============================================================
+    # CAMERA 콜백 (메인 로직)
+    # ============================================================
+    def camera_cb(self, msg):
+        try:
+            twist = Twist()
+            now = rospy.Time.now().to_sec()
+            
+            # 1. ESCAPE 모드 (장애물 회피 중 - 그대로 유지)
+            if self.state == "ESCAPE":
+                self.escape_control()
+                return
+
+            # 2. BACK 모드 (장애물 감지 후 후진 - 그대로 유지)
+            if self.state == "BACK":
+                self.back_control()
+                return
+
+            # 3. LANE 모드 (라바콘 -> 장애물체크 -> 라인 순서)
+            if self.state == "LANE":
+                
+                # 이미지 처리를 가장 먼저 수행
+                frame = self.bridge.compressed_imgmsg_to_cv2(msg, "bgr8")
+                h, w = frame.shape[:2]
+                
+                # ROI: 바닥 쪽 50% 사용
+                roi_y_start = int(h * 0.5)
+                roi = frame[roi_y_start:, :]
+                hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+
+                # ============================================================
+                # 🔴 [1순위] 라바콘(빨간색) 감지 및 우선 주행 로직
+                # -> 라바콘이 보이면 LiDAR 장애물 체크를 무시(return)
+                # ============================================================
+                lower_r1 = np.array([0, 100, 80])
+                upper_r1 = np.array([10, 255, 255])
+                lower_r2 = np.array([170, 100, 80])
+                upper_r2 = np.array([180, 255, 255])
+
+                mask_r1 = cv2.inRange(hsv, lower_r1, upper_r1)
+                mask_r2 = cv2.inRange(hsv, lower_r2, upper_r2)
+                red_mask = cv2.bitwise_or(mask_r1, mask_r2)
+                red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_OPEN, np.ones((3,3), np.uint8))
+                red_contours, _ = cv2.findContours(red_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+                valid_cones = []
+                for cnt in red_contours:
+                    if cv2.contourArea(cnt) > 200:
+                        M = cv2.moments(cnt)
+                        if M["m00"] != 0:
+                            cx = int(M["m10"] / M["m00"])
+                            valid_cones.append(cx)
+
+                # 🔥 라바콘이 발견되면 -> 무조건 라바콘 주행 (장애물 회피 안 함)
+                if len(valid_cones) > 0:
+                    valid_cones.sort()
+                    if len(valid_cones) >= 2:
+                        target_x = (valid_cones[0] + valid_cones[-1]) // 2
+                    else:
+                        cone_x = valid_cones[0]
+                        if cone_x < w // 2:
+                            target_x = w - 100 
+                        else:
+                            target_x = 100
+                    
+                    error = (w // 2) - target_x
+                    twist.linear.x = 0.15
+                    twist.angular.z = error * 0.005 
+                    self.pub.publish(twist)
+                    
+                    # [핵심] return으로 함수 종료 -> 아래의 장애물 감지 코드 실행 안 됨
+                    return
+
+                # ============================================================
+                # 🚫 [2순위] 장애물 감지 (라바콘이 안 보일 때만 실행)
+                # ============================================================
+                limit_dist = 0.3
+                if self.front < limit_dist:
+                    rospy.logwarn(f"장애물 감지(라바콘 아님): {self.front:.2f}m -> 후진")
+                    self.state = "BACK"
+                    self.state_start = now
+                    return
+
+                # ============================================================
+                # ⚫ [3순위] 검은색 라인 트레이싱 (EdgeLaneNoBridge 로직 이식)
+                # ============================================================
+                
+                # 1. 그레이스케일 + 블러
+                gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+                gray = cv2.GaussianBlur(gray, (5, 5), 0)
+
+                # 2. 검은 트랙 강조: THRESH_BINARY_INV + OTSU
+                # (검은색 라인이 흰색(255)이 되고 배경이 검은색(0)이 됨)
+                _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+                # 3. 노이즈 제거
+                kernel = np.ones((3, 3), np.uint8)
+                binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+                binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+
+                # 4. 열별 "검은 픽셀(=255)" 개수 합산
+                col_sum = np.sum(binary > 0, axis=0) 
+                
+                if col_sum.size > 0:
+                    max_val = int(np.max(col_sum))
+                else:
+                    max_val = 0
+
+                # 5. 라인이 잡혔는지 확인
+                if max_val < self.dark_min_pixels:
+                    # 라인 못 찾음 -> 제자리 회전하며 찾기
+                    twist.linear.x = 0.0
+                    twist.angular.z = self.search_speed
+                    self.pub.publish(twist)
+                    return
+
+                # 6. 유효한 트랙 후보 열 추출
+                dark_col_ratio = 0.3
+                threshold_val = max(self.dark_min_pixels, int(max_val * dark_col_ratio))
+                candidates = np.where(col_sum >= threshold_val)[0]
+
+                if candidates.size == 0:
+                    # 후보가 없으면 회전
+                    twist.linear.x = 0.0
+                    twist.angular.z = self.search_speed
+                    self.pub.publish(twist)
+                    return
+
+                # 7. 무게 중심 계산 (Weighted Average)
+                x_indices = np.arange(len(col_sum))
+                track_center_x = float(np.sum(x_indices[candidates] * col_sum[candidates]) /
+                                       np.sum(col_sum[candidates]))
+
+                # 8. 조향 계산
+                center = w / 2.0
+                offset = track_center_x - center 
+                
+                # EdgeLaneNoBridge 코드의 조향 로직 적용
+                ang = -self.k_angle * offset
+                ang = max(min(ang, 0.8), -0.8)
+
+                twist.linear.x = self.speed
+                twist.angular.z = ang
+                self.pub.publish(twist)
+
+        except Exception as e:
+            rospy.logerr(f"Camera Callback Error: {e}")
+
+    # ============================================================
+    # BACK MODE (후진 - 그대로 유지)
+    # ============================================================
+    def back_control(self):
+        twist = Twist()
+        now = rospy.Time.now().to_sec()
+
+        if now - self.state_start < 1.2:
+            twist.linear.x = -0.15
+            twist.angular.z = 0.0
+            self.pub.publish(twist)
+        else:
+            angle = self.find_gap_max()
+            angle = self.apply_escape_direction_logic(angle)
+
+            self.escape_angle = angle
+            self.state = "ESCAPE"
+            self.state_start = now
+            rospy.loginfo(f"ESCAPE 모드 진입: 각도 {self.escape_angle:.2f}")
+
+    # ============================================================
+    # ESCAPE MODE (탈출 - 그대로 유지)
+    # ============================================================
+    def escape_control(self):
+        twist = Twist()
+        now = rospy.Time.now().to_sec()
+
+        if now - self.state_start < 1.4:
+            twist.linear.x = 0.15
+            twist.angular.z = self.escape_angle * 1.5 
+            self.pub.publish(twist)
+        else:
+            rospy.loginfo("LANE 모드 복귀 (라바콘/라인 탐색)")
+            self.state = "LANE"
+
+    # ============================================================
+    # 알고리즘 헬퍼 함수들
+    # ============================================================
+    def apply_escape_direction_logic(self, angle):
+        if self.force_right_escape > 0:
+            self.force_right_escape -= 1
+            return -0.7 
+
+        if angle > 0: 
+            self.left_escape_count += 1
+            if self.left_escape_count >= 3:
+                self.force_right_escape = 2
+                self.left_escape_count = 0
+                return -0.7
+        else:
+            self.left_escape_count = 0
+        
+        return angle
+
+    def find_gap_max(self):
+        if len(self.scan_ranges) == 0:
+            return 0.0
+
+        raw = np.array(self.scan_ranges)
+        ranges = np.concatenate([raw[-60:], raw[:60]])
+        ranges = np.where((ranges < 0.20) | np.isnan(ranges), 0.0, ranges)
+
+        idx = np.argmax(ranges) 
+        
+        angle_deg = (idx - 60) 
+        angle_rad = angle_deg * (np.pi / 180.0)
+
+        return angle_rad
+
+if __name__ == "__main__":
+    try:
+        node = LineTracerWithObstacleAvoidance()
+        rospy.spin()
+    except rospy.ROSInterruptException:
+        pass
