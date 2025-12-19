@@ -1,0 +1,79 @@
+---------터미널1----------
+<SSH 연결>
+ssh agilex@172.30.1.7
+
+<Docker 컨테이너 설치>
+sudo docker run -it --privileged --net=host \
+--name limo_yoon \
+--device=/dev/ttyUSB0:/dev/ttyUSB0 \
+--device=/dev/video0:/dev/video0 \
+--device=/dev/ttyTHS1:/dev/ttyTHS1 \
+onete2580/limo_lane_final_v2:latest bash
+
+<Docker 실행>
+sudo docker exec -it limo_yoon bash
+
+<ROS 환경 설정>
+source /opt/ros/noetic/setup.bash
+source ~/catkin_ws/devel/setup.bash
+
+<로스코어 실행>
+source /opt/ros/noetic/setup.bash
+export ROS_MASTER_URI=http://172.30.1.7:11311
+export ROS_IP=172.30.1.7
+roscore >/tmp/roscore.log 2>&1 &
+rosparam get /rosdistro
+
+---------터미널2----------
+<ssh 연결>
+<docker 실행>
+<ROS 환경 설정>
+<센서(라이다, 카메라) 실행>
+cd ~/catkin_ws
+catkin_make
+source devel/setup.bash
+roslaunch limo_bringup limo_start.launch pub_odom_tf:=false
+
+---------터미널3----------
+<ssh 연결>
+<docker 실행>
+<ROS 환경 설정>
+cd ~/catkin_ws/src
+
+<코드 실행 파일 만들기>
+nano yoonji.py
+-> 코드 복붙 후 Ctrl + o / Enter / Ctrl + x
+<권한 부여>
+chmod +x yoonji.py
+
+<cv bridge 설치>
+환경설정 후 
+apt update
+apt install ros-noetic-cv-bridge
+
+<코드 실행>
+python3 yoonji.py 
+
+
+**git에서 코드 실행**
+sudo apt update
+apt install python3-pip -y
+pip install cv-bridge
+cd ~/catkin_ws/src/
+git clone https://github.com/yoonjiinha/limo_git
+cd limo_git
+ls -> yoonji.py
+환경설정 후 python3 yoonji.py
+
+* cv_bridge 에러
+sudo apt update
+sudo apt install python3-pip -y
+pip3 install cv-bridge
+
+*rospy 에러
+source /opt/ros/noetic/setup.bash
+source ~/catkin_ws/devel/setup.bash
+
+*깃 코드 고친 후 
+git fetch --all
+git reset --hard origin/main
